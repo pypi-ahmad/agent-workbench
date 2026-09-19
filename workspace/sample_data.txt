@@ -1,0 +1,3 @@
+Item: Apples, Qty: 40, UnitCost: 1.5
+Item: Oranges, Qty: 25, UnitCost: 2.0
+Item: Bananas, Qty: 60, UnitCost: 0.75
