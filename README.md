@@ -115,3 +115,8 @@ The Streamlit UI uses a three-column layout:
 - Right column: Live JSON inspector for session state, workspace files, and trace export.
 
 - Workspace: The agent default working directory is [`workspace/`](workspace/).
+
+## License
+
+This project is licensed under the terms of the [MIT License](LICENSE).
+
