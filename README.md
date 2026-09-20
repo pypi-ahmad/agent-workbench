@@ -1,122 +1,84 @@
-# Agent Workbench
+# Tool-calling Agent Workbench
 
-Agent Workbench is a Windows 11 Streamlit application for interacting with LLM agents. It supports multi-turn chat, local tool execution, state inspection, and trace export.
+Windows 11 Streamlit app for chatting with `agnes-3.0-flash` through official
+OpenAI Chat Completions tool calling. Each tool step shows its name, arguments,
+truncated result, and latency.
 
-## Quickstart
+## Run on Windows
 
-### 1. Run with run.cmd
-Double-click `run.cmd` at the repository root:
-```cmd
-run.cmd
+1. Create the Windows User environment variable `AGNESAI_API_KEY`.
+2. Relaunch the coding-agent host or Explorer after creating the variable.
+3. Double-click `run.cmd`.
+
+On the first run, `run.cmd` copies `.env.example` to `.env`, opens it in
+Notepad, and exits. The file contains configuration names only. The app reads
+credentials from the process environment and does not load secrets from
+`.env`.
+
+Double-click `run.cmd` again. It runs:
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\streamlit run app.py
 ```
-The script will:
-- Check for `.env`. If missing, it copies `.env.example` to `.env` and opens Notepad.
-- Create a `.venv` virtual environment if one does not exist.
-- Install or update dependencies from `requirements.txt`.
-- Start the Streamlit application.
 
-### 2. Run manually
-```powershell
-uv venv .venv
-uv pip install -r requirements.txt
-streamlit run app.py
-```
+## Workbench
 
-### 3. Environment variables
-Configure keys in your user environment or in `.env`:
-```ini
-# Primary Provider: Agnes AI
-AGNESAI_API_KEY=your_key_here
-AGNESAI_BASE_URL=https://apihub.agnes-ai.com/v1
-AGNESAI_MODEL=agnes-3.0-flash
+- Default provider: Agnes AI at `https://apihub.agnes-ai.com/v1`
+- Default model: `agnes-3.0-flash`
+- Optional providers appear only when their required environment variables exist
+- Maximum tool steps: 8 by default, 16 hard cap
+- Tools can be enabled or disabled individually in the sidebar
+- JSON and Markdown trace downloads are available in the sidebar
 
-# Optional Providers (shown in UI only when configured)
-OPENAI_API_KEY=
-OPENAI_BASE_URL=
-GOOGLE_API_KEY=
-```
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `list_dir` | List a relative directory under `workspace/` |
+| `read_file` | Read UTF-8 text under `workspace/`, up to 64 KiB |
+| `write_note` | Write a simple filename under `workspace/notes/` |
+| `calc` | Evaluate numbers with `+ - * / ** ()` only |
+| `http_get` | Return status and 4,000 text characters from allowlisted HTTPS |
+| `now` | Return local time as an ISO 8601 string |
+
+File tools reject `..` traversal and paths outside `workspace/`.
+`http_get` permits only `example.com` and `httpbin.org` by default. The app
+contains no shell, subprocess, deletion, OCR, PDF, Qdrant, Docker, or WSL2
+integration.
+
+## Add a tool
+
+1. Add the Python function under `src/tools/`. Return JSON-serializable data
+   and return an `{"error": "..."}` object for expected failures.
+2. Add its OpenAI function schema and handler to `ALL_TOOLS` in
+   `src/tools/registry.py`. Schema property names must match the function
+   parameters.
+3. No separate UI code is required for a standard tool. The sidebar builds one
+   checkbox per `ALL_TOOLS` entry and omits unchecked tools from the API
+   `tools` array.
+
+Run the offline and relevant scripted smokes after adding the function and
+schema.
 
 ## Threat model
 
-The application restricts agent execution to safe operations:
+The model has no shell, subprocess, command runner, or deletion tool. File
+operations stay under `workspace/`; outbound HTTP requires an allowlisted
+HTTPS host; calculator input is interpreted through a restricted arithmetic
+AST. Tool output is treated as data and never executed.
 
-- No shell execution: The agent cannot run system commands, cmd.exe, PowerShell, bash, or `subprocess`. Docker and WSL2 are not used.
-- Safe math evaluation: The `calc` tool parses arithmetic with `ast.parse`. It evaluates basic math operations while rejecting `eval()`, `exec()`, imports, and dunder attributes.
-- Constrained filesystem access: File tools (`read_file`, `list_dir`, `write_note`) operate strictly inside `workspace/`. Paths attempting to access files above `workspace/` are rejected.
-- Outbound network allowlist: The `http_get` tool connects only to allowlisted HTTPS hostnames such as `api.github.com`, `httpbin.org`, and `wttr.in`. Plain HTTP requests and unlisted hosts are blocked.
+## Verify
 
-- Credential safety: API keys remain in the process environment. The application checks whether an environment variable exists without logging or displaying its value. See `AGNESAI_API_KEY` configuration under Environment variables.
-
-See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for full threat boundaries and security mitigations.
-
-
-## How to add a tool
-
-To register a new tool with the workbench:
-
-### Step 1: Write the handler
-Add a Python function in `src/tools/` or a new module:
-```python
-# src/tools/my_tool.py
-from typing import Any, Dict
-
-def reverse_text(text: str) -> Dict[str, Any]:
-    """Reverse input text safely."""
-    return {"reversed": text[::-1]}
+```powershell
+uv run python test_smoke.py
+.venv\Scripts\python scripts\smoke_tools.py
 ```
 
-### Step 2: Register the tool
-Add the tool definition to `ALL_TOOLS` in `src/tools/registry.py`:
-```python
-from src.tools.base import ToolDefinition
-from src.tools.my_tool import reverse_text
+The offline smoke writes `data/cache/smoke_trace.json`. The live smoke requires
+`AGNESAI_API_KEY` in the current process and verifies real `tool_calls`.
 
-ALL_TOOLS["reverse_text"] = ToolDefinition(
-    name="reverse_text",
-    description="Reverse a given string.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "description": "The string to reverse.",
-            },
-        },
-        "required": ["text"],
-    },
-    handler=reverse_text,
-)
-```
-
-### Step 3: Export the tool
-Add the function to `__all__` in `src/tools/__init__.py`:
-```python
-from src.tools.my_tool import reverse_text
-
-__all__ = [
-    ...,
-    "reverse_text",
-]
-```
-
-### Step 4: Verify the tool
-Once registered:
-- The sidebar displays a checkbox to toggle the tool on or off.
-- The agent loop passes the tool schema to OpenAI-compatible models.
-- The tool log records each invocation, arguments, result, and latency.
-
-## Architecture and layout
-
-For architectural details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-The Streamlit UI uses a three-column layout:
-- Left column: Tool execution log with step arguments, outputs, and latency.
-- Center column: Chat dialogue showing user and agent messages.
-- Right column: Live JSON inspector for session state, workspace files, and trace export.
-
-- Workspace: The agent default working directory is [`workspace/`](workspace/).
-
-## License
-
-This project is licensed under the terms of the [MIT License](LICENSE).
-
+See the [API reference](docs/API_REFERENCE.md),
+[architecture](docs/ARCHITECTURE.md), and
+[threat model](docs/THREAT_MODEL.md).
