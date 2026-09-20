@@ -84,14 +84,16 @@ def export_trace_markdown(
     else:
         for idx, step in enumerate(steps, 1):
             name = step.get("name", "unknown")
-            latency = step.get("latency", 0)
-            latency_ms = int(latency * 1000) if isinstance(latency, (int, float)) else "n/a"
+            latency_ms = step.get("ms", "n/a")
             args = step.get("args", {})
-            result = step.get("result", "")
+            result = step.get("result_preview", "")
 
-            lines.append(f"### Step {idx}: `{name}` ({latency_ms} ms)")
-            lines.append(f"- Call ID: `{step.get('tool_call_id', 'n/a')}`")
-            lines.append(f"- Latency: `{latency}s`")
+            lines.append(
+                f"### Step {step.get('i', idx)}: "
+                f"`{step.get('kind', 'unknown')}` / `{name}` ({latency_ms} ms)"
+            )
+            if step.get("error"):
+                lines.append(f"- Error: `{step['error']}`")
             lines.append("")
             lines.append("Arguments:")
             lines.append("```json")

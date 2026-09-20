@@ -1,158 +1,121 @@
-"""Central tool registry providing OpenAI tool definitions and dispatch."""
+"""OpenAI tool schemas and sequential dispatch."""
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 from src.tools.base import ToolDefinition
-from src.tools.file_tools import list_dir, read_file, write_note
-from src.tools.utility_tools import calc, now
-from src.tools.web_tools import http_get
+from src.tools.fs_tools import list_dir, read_file, write_note
+from src.tools.misc_tools import calc, http_get, now
 
 
-ALL_TOOLS: Dict[str, ToolDefinition] = {
+ALL_TOOLS: dict[str, ToolDefinition] = {
     "list_dir": ToolDefinition(
-        name="list_dir",
-        description="List files and directories strictly inside workspace/ (default path is '.').",
-        parameters={
+        "list_dir",
+        "List files and directories inside workspace only.",
+        {
             "type": "object",
             "properties": {
-                "path": {
+                "relative_path": {
                     "type": "string",
-                    "description": "Directory path relative to workspace/ (default is '.').",
+                    "description": "Directory path relative to workspace.",
                     "default": ".",
-                },
+                }
             },
-            "required": [],
+            "additionalProperties": False,
         },
-        handler=list_dir,
+        list_dir,
     ),
     "read_file": ToolDefinition(
-        name="read_file",
-        description="Read contents of a text file strictly inside workspace/.",
-        parameters={
+        "read_file",
+        "Read a UTF-8 text file under workspace, up to 64 KiB.",
+        {
             "type": "object",
             "properties": {
-                "path": {
+                "relative_path": {
                     "type": "string",
-                    "description": "Path to the file inside workspace/.",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters to return (default 10000).",
-                    "default": 10000,
-                },
+                    "description": "File path relative to workspace.",
+                }
             },
-            "required": ["path"],
+            "required": ["relative_path"],
+            "additionalProperties": False,
         },
-        handler=read_file,
+        read_file,
     ),
     "write_note": ToolDefinition(
-        name="write_note",
-        description="Write or append text notes strictly inside workspace/.",
-        parameters={
+        "write_note",
+        "Write text to a simple filename under workspace/notes.",
+        {
             "type": "object",
             "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Note title or filename (e.g. 'notes.md' or 'summary'). Stored in workspace/.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Text content to write or append.",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["append", "overwrite"],
-                    "description": "Write mode: 'append' to add to existing note, or 'overwrite' to replace.",
-                    "default": "append",
-                },
+                "name": {"type": "string", "description": "Simple note filename."},
+                "text": {"type": "string", "description": "Complete note text."},
             },
-            "required": ["title", "content"],
+            "required": ["name", "text"],
+            "additionalProperties": False,
         },
-        handler=write_note,
+        write_note,
     ),
     "calc": ToolDefinition(
-        name="calc",
-        description="Safely evaluate mathematical expressions using AST parser (no eval).",
-        parameters={
+        "calc",
+        "Evaluate arithmetic containing only numbers and + - * / ** parentheses.",
+        {
             "type": "object",
             "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "Arithmetic expression string (e.g. '17 * 19' or 'sqrt(144)').",
-                },
+                "expression": {"type": "string", "description": "Arithmetic expression."}
             },
             "required": ["expression"],
+            "additionalProperties": False,
         },
-        handler=calc,
+        calc,
     ),
     "http_get": ToolDefinition(
-        name="http_get",
-        description="Perform an HTTPS GET request to an allowlisted hostname (HTTPS only).",
-        parameters={
+        "http_get",
+        "GET an allowlisted HTTPS URL and return status plus up to 4000 characters.",
+        {
             "type": "object",
             "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Full HTTPS URL to fetch.",
-                },
-                "timeout_seconds": {
-                    "type": "integer",
-                    "description": "Request timeout in seconds (default 10).",
-                    "default": 10,
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters of response body to return (default 8000).",
-                    "default": 8000,
-                },
+                "url": {"type": "string", "description": "Allowlisted HTTPS URL."}
             },
             "required": ["url"],
+            "additionalProperties": False,
         },
-        handler=http_get,
+        http_get,
     ),
     "now": ToolDefinition(
-        name="now",
-        description="Get current time and date in UTC and local timezone.",
-        parameters={
+        "now",
+        "Return local time as an ISO 8601 string.",
+        {
             "type": "object",
             "properties": {},
-            "required": [],
+            "additionalProperties": False,
         },
-        handler=now,
+        now,
     ),
 }
 
 
-def get_openai_tools(enabled_names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """Return list of tool specifications formatted for OpenAI chat completions."""
-    names = enabled_names if enabled_names is not None else list(ALL_TOOLS.keys())
-    return [
-        ALL_TOOLS[name].to_openai_schema()
-        for name in names
-        if name in ALL_TOOLS
-    ]
+def get_openai_tools(enabled_names: list[str] | None = None) -> list[dict[str, Any]]:
+    names = enabled_names if enabled_names is not None else list(ALL_TOOLS)
+    return [ALL_TOOLS[name].to_openai_schema() for name in names if name in ALL_TOOLS]
 
 
-def execute_tool_call(tool_name: str, arguments: Any) -> Dict[str, Any]:
-    """Execute a registered tool by name with parsed or JSON-string arguments."""
+def execute_tool_call(tool_name: str, arguments: str | dict[str, Any]) -> Any:
     if tool_name not in ALL_TOOLS:
-        return {"error": f"Tool '{tool_name}' is not registered."}
-
-    tool = ALL_TOOLS[tool_name]
-
+        return {"error": f"Tool is not registered: {tool_name}"}
     if isinstance(arguments, str):
         try:
-            kwargs = json.loads(arguments) if arguments.strip() else {}
-        except json.JSONDecodeError as e:
-            return {"error": f"Failed to parse tool arguments JSON: {str(e)}"}
+            parsed = json.loads(arguments) if arguments.strip() else {}
+        except json.JSONDecodeError as exc:
+            return {"error": f"Malformed tool arguments: {exc}"}
     elif isinstance(arguments, dict):
-        kwargs = arguments
+        parsed = arguments
     else:
-        kwargs = {}
-
+        return {"error": "Tool arguments must be a JSON object."}
+    if not isinstance(parsed, dict):
+        return {"error": "Tool arguments must decode to a JSON object."}
     try:
-        return tool.handler(**kwargs)
-    except TypeError as e:
-        return {"error": f"Invalid tool arguments provided to {tool_name}: {str(e)}"}
-    except Exception as e:
-        return {"error": f"Tool execution failed: {str(e)}"}
+        return ALL_TOOLS[tool_name].handler(**parsed)
+    except TypeError as exc:
+        return {"error": f"Invalid tool arguments: {exc}"}
+    except Exception as exc:
+        return {"error": f"Tool failed: {exc}"}

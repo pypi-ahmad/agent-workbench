@@ -1,5 +1,7 @@
 # Agent workbench workspace
 
+Workbench sandbox file.
+
 Default working directory for the agent.
 
 ## Sample files

@@ -1,105 +1,81 @@
-"""Scripted smoke test verifying live tool calling with Agnes AI."""
+"""Live scripted smoke for Agnes Chat Completions tool calling."""
 
-import json
 import os
 from pathlib import Path
 import sys
 
-# Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.agent import DEFAULT_WORKSPACE_DIR, WorkbenchAgent
 from src.agnes_client import DEFAULT_AGNES_MODEL, get_client
 from src.export import export_trace_json, export_trace_markdown
 
+PROMPT = "List files in the workspace, read sample.txt, and compute 17*19."
 
-def run_smoke_tools():
-    print("[1] Verifying AGNESAI_API_KEY...")
+
+def run_smoke_tools() -> None:
+    print("[1] Checking AGNESAI_API_KEY presence")
     if not os.environ.get("AGNESAI_API_KEY", "").strip():
-        print("ERROR: AGNESAI_API_KEY is not configured in environment.")
-        sys.exit(1)
-    print("  OK: AGNESAI_API_KEY is configured.")
+        raise RuntimeError("AGNESAI_API_KEY is unavailable.")
 
-    print("[2] Initializing WorkbenchAgent...")
-    client, err = get_client("Agnes AI")
-    if err or client is None:
-        print(f"ERROR initializing Agnes client: {err}")
-        sys.exit(1)
+    print("[2] Creating Agnes client")
+    client, error = get_client("Agnes AI")
+    if client is None:
+        raise RuntimeError(error or "Agnes client is unavailable.")
 
     agent = WorkbenchAgent(
         client=client,
-        provider_name="Agnes AI",
         model=DEFAULT_AGNES_MODEL,
         working_dir=DEFAULT_WORKSPACE_DIR,
         max_steps=8,
     )
-    print(f"  OK: WorkbenchAgent ready with workspace at: {agent.working_dir}")
+    print(f"[3] Prompt: {PROMPT}")
+    result = agent.run_turn(PROMPT)
 
-    prompt = "List workspace files and compute 17*19."
-    print(f"[3] Running agent turn with prompt: '{prompt}'...")
+    tool_names = [
+        step["name"] for step in result["steps"] if step["kind"] == "tool"
+    ]
+    final_text = result["final_content"]
+    print(f"Tools: {tool_names}")
+    print(f"Final: {final_text}")
 
-    result = agent.run_turn(prompt)
-    print(f"  Turn status: {result['status']}")
-    print(f"  Steps executed: {result['steps_count']}")
-    print(f"  Turn latency: {result['total_latency']}s")
+    assert any(name in {"list_dir", "read_file"} for name in tool_names), (
+        "Trace requires list_dir or read_file."
+    )
+    assert "calc" in tool_names, "Trace requires calc."
+    assert "323" in final_text, "Final assistant text must contain 323."
+    assert "WORKBENCH_FIXTURE_OK" in final_text, (
+        "Final assistant text must contain WORKBENCH_FIXTURE_OK."
+    )
 
-    called_tool_names = [s["name"] for s in result["steps"]]
-    print(f"  Tools called: {called_tool_names}")
-
-    print("\n----- Agent Final Content -----")
-    print(result["final_content"])
-    print("--------------------------------\n")
-
-    # Assertions: must use a file tool and calc
-    has_file_tool = any(t in ("list_dir", "read_file") for t in called_tool_names)
-    has_calc_tool = "calc" in called_tool_names
-
-    if not has_file_tool:
-        print("ERROR: Expected at least one call to 'list_dir' or 'read_file'.")
-        sys.exit(1)
-
-    if not has_calc_tool:
-        print("ERROR: Expected at least one call to 'calc'.")
-        sys.exit(1)
-
-    print("  OK: File tool and calc successfully invoked.")
-
-    # Save data/cache/smoke_trace.json
     cache_dir = Path("data/cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    trace_json_path = cache_dir / "smoke_trace.json"
-    trace_md_path = cache_dir / "smoke_trace.md"
-
-    trace_json_content = export_trace_json(
-        provider_name="Agnes AI",
-        model=DEFAULT_AGNES_MODEL,
-        working_dir=str(agent.working_dir),
-        messages=agent.messages,
-        steps=result["steps"],
-        total_latency=result["total_latency"],
+    json_path = cache_dir / "smoke_trace.json"
+    markdown_path = cache_dir / "smoke_trace.md"
+    json_path.write_text(
+        export_trace_json(
+            "Agnes AI",
+            DEFAULT_AGNES_MODEL,
+            str(agent.working_dir),
+            result["messages"],
+            result["steps"],
+            result["total_latency"],
+        ),
+        encoding="utf-8",
     )
-    trace_json_path.write_text(trace_json_content, encoding="utf-8")
-
-    trace_md_content = export_trace_markdown(
-        provider_name="Agnes AI",
-        model=DEFAULT_AGNES_MODEL,
-        working_dir=str(agent.working_dir),
-        messages=agent.messages,
-        steps=result["steps"],
-        total_latency=result["total_latency"],
+    markdown_path.write_text(
+        export_trace_markdown(
+            "Agnes AI",
+            DEFAULT_AGNES_MODEL,
+            str(agent.working_dir),
+            result["messages"],
+            result["steps"],
+            result["total_latency"],
+        ),
+        encoding="utf-8",
     )
-    trace_md_path.write_text(trace_md_content, encoding="utf-8")
-
-    print(f"[4] Trace saved to {trace_json_path}")
-
-    # Verify trace file exists on disk and contains the required tools
-    assert trace_json_path.exists(), f"Missing trace file: {trace_json_path}"
-    saved_text = trace_json_path.read_text(encoding="utf-8")
-    assert '"calc"' in saved_text, "Trace does not contain calc tool step"
-    assert ('"list_dir"' in saved_text or '"read_file"' in saved_text), "Trace does not contain file tool step"
-
-    print("  OK: Verified data/cache/smoke_trace.json exists and contains file tool and calc.")
-    print("\nALL SMOKE_TOOLS CHECKS PASSED.")
+    assert json_path.exists()
+    print(f"PASS: {json_path}")
 
 
 if __name__ == "__main__":
