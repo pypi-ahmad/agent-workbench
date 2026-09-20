@@ -10,4 +10,10 @@ if not exist ".env" (
 
 py -3 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\streamlit run app.py
+
+set "STREAMLIT_PORT=8590"
+for /f %%P in ('powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -LocalPort %STREAMLIT_PORT% -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty OwningProcess"') do (
+    taskkill /PID %%P /F >nul 2>&1
+)
+
+.venv\Scripts\streamlit run app.py --server.port %STREAMLIT_PORT%

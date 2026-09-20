@@ -20,8 +20,11 @@ Double-click `run.cmd` again. It runs:
 ```bat
 py -3 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\streamlit run app.py
+.venv\Scripts\streamlit run app.py --server.port 8590
 ```
+
+Before launch, the script closes only a process listening on port `8590`, if
+one exists. The app then starts at `http://localhost:8590`.
 
 ## Workbench
 
