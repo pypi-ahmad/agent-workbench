@@ -1,304 +1,215 @@
-"""Streamlit Agent Workbench Application.
+"""Windows-native Streamlit UI for the tool-calling agent workbench."""
 
-Layout:
-- Left Column: Tool Execution Log (name, args, truncated result, ms)
-- Center Column: Multi-turn Chat Conversation
-- Right Column: Live State JSON Inspector & Trace Exporter
-"""
-
-import json
 import os
-from pathlib import Path
-import platform
-import sys
+
 import streamlit as st
 
 from src.agent import DEFAULT_WORKSPACE_DIR, WorkbenchAgent
-from src.agnes_client import (
-    detect_available_providers,
-    get_client,
-)
+from src.agnes_client import detect_available_providers, get_client
+from src.config import DEFAULT_MAX_STEPS, HARD_MAX_STEPS
 from src.export import export_trace_json, export_trace_markdown
-from src.tools.file_tools import get_working_dir, list_dir
+from src.tools.fs_tools import list_dir
 from src.tools.registry import ALL_TOOLS
 
-# Configure wide layout
-st.set_page_config(
-    page_title="Agent Workbench",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Tool-calling Agent Workbench", layout="wide")
 
-# Initialize Session State
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+for key, default in {
+    "chat_messages": [],
+    "api_messages": [],
+    "tool_steps": [],
+}.items():
+    st.session_state.setdefault(key, default)
 
-if "raw_messages" not in st.session_state:
-    st.session_state.raw_messages = []
 
-if "step_logs" not in st.session_state:
-    st.session_state.step_logs = []
+def render_step(step: dict, *, live: bool = False) -> None:
+    """Render all required tool telemetry."""
+    label = f"#{step['i']} · {step['kind']} · {step['name']} · {step['ms']} ms"
+    container = (
+        st.status(label, state="complete", type="step")
+        if live
+        else st.expander(label, type="step")
+    )
+    with container:
+        st.markdown("Arguments")
+        st.json(step["args"])
+        st.markdown("Result preview")
+        st.code(step["result_preview"], language="text")
+        if step["error"]:
+            st.error(step["error"])
 
-# Sidebar Configuration
+
+providers = detect_available_providers()
+
 with st.sidebar:
-    st.title("⚙️ Workbench Config")
-
-    # Detect providers strictly based on existing env variables (no secret leakage)
-    available_providers = detect_available_providers()
-    provider_names = list(available_providers.keys())
-
-    selected_provider = st.selectbox(
+    st.header("Workbench settings")
+    provider_name = st.selectbox(
         "Provider",
-        options=provider_names,
-        index=provider_names.index("Agnes AI") if "Agnes AI" in provider_names else 0,
-        help="Providers appear only when their corresponding environment variables exist.",
+        list(providers),
+        index=list(providers).index("Agnes AI"),
+        key="provider",
     )
+    provider = providers[provider_name]
+    model = st.selectbox("Model", provider["models"], key="model")
+    key_name = provider["api_key_env"]
+    key_available = bool(os.environ.get(key_name, "").strip())
+    agnes_key_available = bool(os.environ.get("AGNESAI_API_KEY", "").strip())
+    st.caption(f"AGNESAI_API_KEY set: {'yes' if agnes_key_available else 'no'}")
+    if not agnes_key_available:
+        st.error("Missing required environment variable: AGNESAI_API_KEY")
+    if not key_available:
+        st.warning(f"{key_name} is unavailable. Relaunch the host if recently configured.")
 
-    prov_cfg = available_providers[selected_provider]
-    models = prov_cfg.get("models", ["agnes-3.0-flash"])
-    default_model = prov_cfg.get("default_model", models[0])
-
-    selected_model = st.selectbox(
-        "Model",
-        options=models,
-        index=models.index(default_model) if default_model in models else 0,
-    )
-
-    # Status check for API key
-    required_env = prov_cfg.get("required_env", "AGNESAI_API_KEY")
-    key_is_present = bool(os.environ.get(required_env, "").strip())
-
-    if key_is_present:
-        st.success(f"Key configured: `{required_env}`", icon="✅")
-    else:
-        st.warning(f"Missing `{required_env}`. Set it in environment or `.env`.", icon="⚠️")
-
-    st.markdown("---")
-    st.subheader("📁 Working Directory")
-    st.caption("Filesystem sandbox root for file tools:")
-    st.code(str(DEFAULT_WORKSPACE_DIR), language="text")
-
-    st.markdown("---")
-    st.subheader("⚙️ Execution Limits")
     max_steps = st.number_input(
-        "Max Steps per Turn",
+        "Maximum tool steps",
         min_value=1,
-        max_value=20,
-        value=8,
+        max_value=HARD_MAX_STEPS,
+        value=DEFAULT_MAX_STEPS,
         step=1,
-        help="Maximum tool execution steps allowed per agent turn (default 8).",
+        help=f"Default {DEFAULT_MAX_STEPS}; hard cap {HARD_MAX_STEPS}.",
+        key="max_steps",
     )
 
-    st.markdown("---")
-    st.subheader("🛠️ Enable / Disable Tools")
-    enabled_tools = []
-    for tool_name in ALL_TOOLS.keys():
-        if st.checkbox(tool_name, value=True, key=f"tool_toggle_{tool_name}"):
-            enabled_tools.append(tool_name)
+    st.subheader("Enabled tools")
+    enabled_tools = [
+        name
+        for name in ALL_TOOLS
+        if st.checkbox(name, value=True, key=f"tool_{name}")
+    ]
 
-    st.markdown("---")
-    st.subheader("📥 Export Trace")
-    trace_json_sidebar = export_trace_json(
-        provider_name=selected_provider,
-        model=selected_model,
-        working_dir=str(DEFAULT_WORKSPACE_DIR),
-        messages=st.session_state.raw_messages,
-        steps=st.session_state.step_logs,
-    )
-    trace_md_sidebar = export_trace_markdown(
-        provider_name=selected_provider,
-        model=selected_model,
-        working_dir=str(DEFAULT_WORKSPACE_DIR),
-        messages=st.session_state.raw_messages,
-        steps=st.session_state.step_logs,
-    )
-    sb_exp1, sb_exp2 = st.columns(2)
-    with sb_exp1:
-        st.download_button(
-            "💾 JSON",
-            data=trace_json_sidebar,
-            file_name="agent_trace.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    with sb_exp2:
-        st.download_button(
-            "📝 Markdown",
-            data=trace_md_sidebar,
-            file_name="agent_trace.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
-    st.markdown("---")
-    if st.button("🧹 Clear Chat History", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.raw_messages = []
-        st.session_state.step_logs = []
+    if st.button("Clear conversation", icon=":material/delete:", width="stretch"):
+        st.session_state.chat_messages = []
+        st.session_state.api_messages = []
+        st.session_state.tool_steps = []
         st.rerun()
 
-# 3-Column Layout: Left = Tool Log, Center = Chat, Right = State JSON
-col_left, col_center, col_right = st.columns([1, 1.8, 1.2], gap="medium")
+    trace_json = export_trace_json(
+        provider_name,
+        model,
+        str(DEFAULT_WORKSPACE_DIR),
+        st.session_state.api_messages,
+        st.session_state.tool_steps,
+    )
+    trace_markdown = export_trace_markdown(
+        provider_name,
+        model,
+        str(DEFAULT_WORKSPACE_DIR),
+        st.session_state.api_messages,
+        st.session_state.tool_steps,
+    )
+    st.download_button(
+        "Download JSON trace",
+        trace_json,
+        "agent_trace.json",
+        "application/json",
+        icon=":material/download:",
+        width="stretch",
+    )
+    st.download_button(
+        "Download Markdown trace",
+        trace_markdown,
+        "agent_trace.md",
+        "text/markdown",
+        icon=":material/download:",
+        width="stretch",
+    )
 
-# ----------------- Left Column: Tool Log -----------------
-with col_left:
-    st.subheader("🛠️ Tool Log")
-    if not st.session_state.step_logs:
-        st.info("No tool steps executed yet.")
-    else:
-        for idx, entry in enumerate(reversed(st.session_state.step_logs)):
-            step_num = len(st.session_state.step_logs) - idx
-            latency_ms = entry.get("latency_ms", int(entry.get("latency", 0) * 1000))
-            header_label = f"#{step_num}: {entry.get('name')} ({latency_ms} ms)"
-            with st.expander(header_label, expanded=idx == 0):
-                st.caption(f"Call ID: `{entry.get('tool_call_id', 'n/a')}` | Latency: `{latency_ms} ms` ({entry.get('latency', 0)}s)")
-                st.markdown("**Arguments:**")
-                st.json(entry.get("args", {}))
+st.title("Tool-calling Agent Workbench")
+st.caption("Chat with Agnes 3.0 Flash and inspect every tool call.")
 
-                st.markdown("**Result (truncated):**")
-                st.code(entry.get("result", ""), language="json")
+tool_column, chat_column, state_column = st.columns([1.1, 2, 1.1], gap="medium")
 
-                with st.expander("Raw Payload"):
-                    st.json(entry.get("raw_result", {}))
+with tool_column:
+    st.subheader("Tool timeline")
+    if not st.session_state.tool_steps:
+        st.info("No tool calls yet.")
+    for saved_step in reversed(st.session_state.tool_steps):
+        render_step(saved_step)
 
-# ----------------- Center Column: Chat -----------------
-with col_center:
-    st.subheader("💬 Chat")
+with chat_column:
+    st.subheader("Chat")
+    for chat_message in st.session_state.chat_messages:
+        with st.chat_message(chat_message["role"]):
+            st.markdown(chat_message["content"])
+            for saved_step in chat_message.get("steps", []):
+                render_step(saved_step)
 
-    # Render past conversation messages
-    for msg in st.session_state.messages:
-        role = msg["role"]
-        with st.chat_message(role):
-            st.markdown(msg["content"])
-            if "steps" in msg and msg["steps"]:
-                with st.expander(f"Executed {len(msg['steps'])} step(s)"):
-                    for s in msg["steps"]:
-                        lat_ms = s.get("latency_ms", int(s.get("latency", 0) * 1000))
-                        st.markdown(f"- `{s['name']}` ({lat_ms} ms)")
-
-    # Chat Input
-    user_prompt = st.chat_input("Ask a question or give a task...")
-    if user_prompt:
-        st.session_state.messages.append({"role": "user", "content": user_prompt})
-
+    prompt = st.chat_input("Ask Agnes to inspect, calculate, fetch, or write a note.")
+    if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.markdown(user_prompt)
+            st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            client, err = get_client(selected_provider)
-            if err or client is None:
-                err_msg = f"⚠️ Configuration Error: {err}"
-                st.error(err_msg)
-                st.session_state.messages.append({"role": "assistant", "content": err_msg})
+            if not agnes_key_available:
+                client, error = (
+                    None,
+                    "Missing required environment variable: AGNESAI_API_KEY",
+                )
             else:
-                with st.spinner(f"Agent thinking with {selected_model}..."):
-                    try:
+                client, error = get_client(provider_name)
+            if client is None:
+                message = error or "Provider client is unavailable."
+                st.error(message)
+                st.session_state.chat_messages.append(
+                    {"role": "assistant", "content": message}
+                )
+            else:
+                turn_steps: list[dict] = []
+
+                def show_step(step: dict) -> None:
+                    turn_steps.append(step)
+                    st.session_state.tool_steps.append(step)
+                    render_step(step, live=True)
+
+                try:
+                    with st.spinner("Waiting for model"):
                         agent = WorkbenchAgent(
                             client=client,
-                            provider_name=selected_provider,
-                            model=selected_model,
-                            working_dir=DEFAULT_WORKSPACE_DIR,
+                            provider_name=provider_name,
+                            model=model,
                             enabled_tools=enabled_tools,
                             max_steps=int(max_steps),
                         )
-
-                        if st.session_state.raw_messages:
-                            agent.messages = list(st.session_state.raw_messages)
-
-                        turn_steps_collected = []
-
-                        def on_step_callback(step_data):
-                            turn_steps_collected.append(step_data)
-                            st.session_state.step_logs.append(step_data)
-
-                        res = agent.run_turn(user_prompt, on_step=on_step_callback)
-                        final_text = res.get("final_content", "")
-                        st.session_state.raw_messages = res.get("messages", [])
-
-                        st.session_state.messages.append({
+                        if st.session_state.api_messages:
+                            agent.messages = list(st.session_state.api_messages)
+                        result = agent.run(prompt, on_step=show_step)
+                    answer = result["final_content"]
+                    st.markdown(answer)
+                    st.session_state.api_messages = result["messages"]
+                    st.session_state.chat_messages.append(
+                        {
                             "role": "assistant",
-                            "content": final_text,
-                            "steps": turn_steps_collected,
-                        })
-
-                        st.markdown(final_text)
-                        if turn_steps_collected:
-                            with st.expander(f"Completed {len(turn_steps_collected)} tool step(s)"):
-                                for s in turn_steps_collected:
-                                    lat_ms = s.get("latency_ms", int(s.get("latency", 0) * 1000))
-                                    st.write(f"- `{s['name']}`: {s['args']} ({lat_ms} ms)")
-
-                    except Exception as ex:
-                        error_text = f"Agent execution error: {str(ex)}"
-                        st.error(error_text)
-                        st.session_state.messages.append({"role": "assistant", "content": error_text})
-
+                            "content": answer,
+                            "steps": turn_steps,
+                        }
+                    )
+                except Exception as exc:
+                    message = f"Agent request failed: {exc}"
+                    st.error(message)
+                    st.session_state.chat_messages.append(
+                        {"role": "assistant", "content": message, "steps": turn_steps}
+                    )
         st.rerun()
 
-# ----------------- Right Column: State JSON -----------------
-with col_right:
-    st.subheader("📊 State Inspector")
-
-    workspace_listing = list_dir(".")
-
-    inspector_state = {
-        "provider": {
-            "name": selected_provider,
-            "model": selected_model,
-            "key_configured": key_is_present,
-        },
-        "session": {
-            "displayed_messages_count": len(st.session_state.messages),
-            "raw_turns_count": len(st.session_state.raw_messages),
-            "total_steps_executed": len(st.session_state.step_logs),
-            "max_steps": int(max_steps),
-            "active_tools": enabled_tools,
-            "working_directory": str(DEFAULT_WORKSPACE_DIR),
-        },
-        "workspace_files": workspace_listing.get("entries", []),
-        "system_environment": {
-            "os": platform.platform(),
-            "python_version": sys.version.split()[0],
-            "cwd": str(Path.cwd()),
-        },
-        "latest_step": st.session_state.step_logs[-1] if st.session_state.step_logs else None,
-    }
-
-    st.json(inspector_state)
-
-    st.markdown("---")
-    st.subheader("📥 Export Trace")
-    trace_json_inspector = export_trace_json(
-        provider_name=selected_provider,
-        model=selected_model,
-        working_dir=str(DEFAULT_WORKSPACE_DIR),
-        messages=st.session_state.raw_messages,
-        steps=st.session_state.step_logs,
+with state_column:
+    st.subheader("Live state")
+    workspace = list_dir(".")
+    st.json(
+        {
+            "provider": provider_name,
+            "model": model,
+            "credential_available": key_available,
+            "enabled_tools": enabled_tools,
+            "maximum_steps": int(max_steps),
+            "tool_calls": sum(
+                step["kind"] == "tool" for step in st.session_state.tool_steps
+            ),
+            "model_steps": sum(
+                step["kind"] == "model" for step in st.session_state.tool_steps
+            ),
+            "messages": st.session_state.chat_messages,
+            "api_messages": st.session_state.api_messages,
+            "workspace": str(DEFAULT_WORKSPACE_DIR),
+            "workspace_entries": workspace.get("entries", []),
+        }
     )
-    trace_md_inspector = export_trace_markdown(
-        provider_name=selected_provider,
-        model=selected_model,
-        working_dir=str(DEFAULT_WORKSPACE_DIR),
-        messages=st.session_state.raw_messages,
-        steps=st.session_state.step_logs,
-    )
-    insp_col1, insp_col2 = st.columns(2)
-    with insp_col1:
-        st.download_button(
-            "💾 Export JSON",
-            data=trace_json_inspector,
-            file_name="agent_trace.json",
-            mime="application/json",
-            use_container_width=True,
-            key="insp_export_json",
-        )
-    with insp_col2:
-        st.download_button(
-            "📝 Export Markdown",
-            data=trace_md_inspector,
-            file_name="agent_trace.md",
-            mime="text/markdown",
-            use_container_width=True,
-            key="insp_export_md",
-        )

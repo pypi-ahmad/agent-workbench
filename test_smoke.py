@@ -1,117 +1,217 @@
-"""Offline smoke test verifying tool execution, schemas, and workspace sandbox."""
+"""Offline smoke checks for product, security, agent loop, and Streamlit UI."""
 
-import sys
+import ast
 from pathlib import Path
+from types import SimpleNamespace
 
-# Add project root to sys.path
-sys.path.insert(0, str(Path(__file__).parent))
+from streamlit.testing.v1 import AppTest
 
-from src.agnes_client import detect_available_providers
-from src.tools.file_tools import list_dir, read_file, write_note, DEFAULT_WORKSPACE_DIR
-from src.tools.registry import ALL_TOOLS, execute_tool_call, get_openai_tools
-from src.tools.utility_tools import calc, now
-from src.tools.web_tools import get_allowed_hosts, http_get
-from src.export import export_trace_json, export_trace_markdown
+from src.agent import WorkbenchAgent
+from src.agnes_client import chat_completion_with_429_retries, detect_available_providers
+from src.config import HARD_MAX_STEPS, HTTP_ALLOWED_HOSTS, WORKSPACE_DIR
+from src.export import export_trace_json
+from src.tools.fs_tools import list_dir, read_file, write_note
+from src.tools.misc_tools import calc, http_get, now
+from src.tools.registry import get_openai_tools
+
+ROOT = Path(__file__).resolve().parent
 
 
-def run_smoke():
-    print("[1] Checking Tool Registry...")
-    tools = get_openai_tools()
-    expected_tools = {"list_dir", "read_file", "write_note", "calc", "http_get", "now"}
-    registered_names = {t["function"]["name"] for t in tools}
-    assert registered_names == expected_tools, f"Expected {expected_tools}, got {registered_names}"
-    for t in tools:
-        assert t["type"] == "function"
-        assert "name" in t["function"]
-        assert "description" in t["function"]
-    print(f"  OK: 6 v1 tools registered with valid OpenAI schemas: {sorted(registered_names)}.")
-
-    print("[2] Testing calc tool...")
-    c1 = calc("10 * (5 + 3)")
-    assert c1.get("result") == 80, f"Unexpected calc result: {c1}"
-    c2 = calc("sqrt(256) + 4")
-    assert c2.get("result") == 20.0, f"Unexpected calc result: {c2}"
-    c_err = calc("__import__('os').system('dir')")
-    assert "error" in c_err, "Calc security check failed; should reject dunder/import"
-    print("  OK: calc passed evaluation and security boundaries.")
-
-    print("[3] Testing now tool...")
-    n = now()
-    assert "utc_iso" in n and "local_iso" in n
-    print(f"  OK: now returned {n['local_iso']}")
-
-    print("[4] Testing write_note tool...")
-    wn = write_note("smoke_test_note.txt", "Initial smoke note line.\n", mode="overwrite")
-    assert wn.get("status") == "ok", f"write_note failed: {wn}"
-    assert "workspace" in wn.get("path", "")
-
-    # Append
-    wn_app = write_note("smoke_test_note.txt", "Second line appended.\n", mode="append")
-    assert wn_app.get("status") == "ok"
-
-    # Read back through read_file
-    rf = read_file("smoke_test_note.txt")
-    assert "Initial smoke note line." in rf.get("content", "")
-    assert "Second line appended." in rf.get("content", "")
-    print(f"  OK: write_note created and appended to note successfully.")
-
-    print("[5] Testing workspace filesystem sandbox...")
-    ld = list_dir(".")
-    assert ld.get("count", 0) > 0, "Workspace directory listing should not be empty"
-    
-    # Boundary violation test: reading outside workspace must be blocked
-    above_read = read_file("../app.py")
-    assert "error" in above_read and ("outside workspace" in above_read["error"].lower() or "denied" in above_read["error"].lower()), (
-        f"Path traversal above workspace was not blocked: {above_read}"
+def _tool_call(index: int, name: str = "now", arguments: str = "{}") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=f"call_{index}",
+        function=SimpleNamespace(name=name, arguments=arguments),
     )
 
-    above_list = list_dir("../src")
-    assert "error" in above_list and ("outside workspace" in above_list["error"].lower() or "denied" in above_list["error"].lower()), (
-        f"Directory listing above workspace was not blocked: {above_list}"
-    )
-    print(f"  OK: workspace/ sandbox strictly enforced (traversal attempts rejected).")
 
-    print("[6] Testing web_tools HTTPS allowlist...")
-    http_attempt = http_get("http://api.github.com")
-    assert "error" in http_attempt and "https is permitted" in http_attempt["error"].lower()
+class _FakeCompletions:
+    def __init__(self, responses: list[SimpleNamespace]) -> None:
+        self.responses = responses
+        self.requests: list[dict] = []
 
-    untrusted_domain = http_get("https://untrusted-external-domain.org")
-    assert "error" in untrusted_domain and "not permitted by allowlist policy" in untrusted_domain["error"]
-    print("  OK: http_get strictly enforces HTTPS and domain allowlist.")
+    def create(self, **request):
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
-    print("[7] Testing provider detection...")
-    providers = detect_available_providers()
-    assert "Agnes AI" in providers
-    print(f"  OK: Providers detected cleanly: {list(providers.keys())}")
 
-    print("[8] Testing tool dispatcher...")
-    dispatch_calc = execute_tool_call("calc", '{"expression": "40 + 2"}')
-    assert dispatch_calc.get("result") == 42
-    dispatch_note = execute_tool_call("write_note", '{"title": "dispatch_test", "content": "hello"}')
-    assert dispatch_note.get("status") == "ok"
-    print("  OK: execute_tool_call dispatch succeeded for calc and write_note.")
+def _response(*, content: str = "", calls: list[SimpleNamespace] | None = None):
+    message = SimpleNamespace(content=content, tool_calls=calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-    print("[9] Testing trace export (JSON and Markdown)...")
-    sample_steps = [{
-        "step_index": 1,
-        "name": "calc",
-        "args": {"expression": "2+2"},
-        "result": "4",
-        "latency": 0.001,
-        "latency_ms": 1,
-        "tool_call_id": "call_1",
-    }]
-    sample_msgs = [
-        {"role": "user", "content": "What is 2+2?"},
-        {"role": "assistant", "content": "It is 4."},
+
+def run_smoke() -> None:
+    print("[1] Product files and launcher")
+    env_lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    assert env_lines == [
+        "AGNESAI_API_KEY=",
+        "AGNES_BASE_URL=https://apihub.agnes-ai.com/v1",
     ]
-    t_json = export_trace_json("Agnes AI", "agnes-3.0-flash", str(DEFAULT_WORKSPACE_DIR), sample_msgs, sample_steps)
-    assert '"calc"' in t_json and '"total_steps": 1' in t_json
-    t_md = export_trace_markdown("Agnes AI", "agnes-3.0-flash", str(DEFAULT_WORKSPACE_DIR), sample_msgs, sample_steps)
-    assert "# Agent Workbench Execution Trace" in t_md and "### Step 1: `calc`" in t_md
-    print("  OK: Trace JSON and Markdown exports generated successfully.")
+    launcher = (ROOT / "run.cmd").read_text(encoding="utf-8")
+    for command in (
+        "py -3 -m venv .venv",
+        ".venv\\Scripts\\pip install -r requirements.txt",
+        ".venv\\Scripts\\streamlit run app.py",
+    ):
+        assert command in launcher
+    assert (ROOT / "workspace" / "sample.txt").read_text(encoding="utf-8").strip() == (
+        "WORKBENCH_FIXTURE_OK"
+    )
+    assert "Workbench sandbox file." in (
+        ROOT / "workspace" / "README.md"
+    ).read_text(encoding="utf-8")
+    assert (ROOT / "src" / "tools" / "fs_tools.py").exists()
+    assert (ROOT / "src" / "tools" / "misc_tools.py").exists()
 
-    print("\nALL OFFLINE SMOKE CHECKS PASSED.")
+    print("[2] Six official tool schemas")
+    names = {tool["function"]["name"] for tool in get_openai_tools()}
+    assert names == {"list_dir", "read_file", "write_note", "calc", "http_get", "now"}
+    assert {
+        tool["function"]["name"] for tool in get_openai_tools(["calc", "now"])
+    } == {"calc", "now"}
+
+    print("[3] Calculator and time")
+    assert calc("17 * 19")["result"] == 323
+    assert "error" in calc("__import__('os').system('dir')")
+    assert "T" in now()
+
+    print("[4] Workspace file sandbox")
+    assert list_dir(".")["path"] == "."
+    assert "error" in read_file("../app.py")
+    assert "error" in read_file(r"C:\Windows\win.ini")
+    written = write_note("smoke.txt", "smoke")
+    assert written["path"] == "notes/smoke.txt"
+    assert read_file("notes/smoke.txt")["text"] == "smoke"
+    assert "error" in write_note(r"C:\outside.txt", "blocked")
+
+    print("[5] HTTPS host policy")
+    assert HTTP_ALLOWED_HOSTS == {"example.com", "httpbin.org"}
+    assert "error" in http_get("file:///etc/passwd")
+    assert "error" in http_get("http://example.com")
+    assert "error" in http_get("https://localhost/test")
+
+    print("[6] Provider visibility")
+    providers = detect_available_providers()
+    assert providers["Agnes AI"]["models"] == ["agnes-3.0-flash"]
+
+    print("[7] HTTP 429 retry")
+    rate_limit = RuntimeError("rate limited")
+    rate_limit.status_code = 429
+    retry_completions = _FakeCompletions(
+        [rate_limit, rate_limit, _response(content="recovered")]
+    )
+    retry_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=retry_completions)
+    )
+    waits: list[int] = []
+    recovered = chat_completion_with_429_retries(
+        retry_client, {"model": "test", "messages": []}, sleep=waits.append
+    )
+    assert recovered.choices[0].message.content == "recovered"
+    assert waits == [1, 2]
+
+    print("[8] Official Chat Completions tool loop")
+    completions = _FakeCompletions(
+        [
+            _response(calls=[_tool_call(1, "calc", '{"expression":"6*7"}')]),
+            _response(content="42"),
+        ]
+    )
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    agent = WorkbenchAgent(client=fake_client, enabled_tools=["calc"])
+    result = agent.run("Calculate 6*7")
+    assert result["final_content"] == "42"
+    assert result["steps"][0]["kind"] == "model"
+    assert result["steps"][1]["name"] == "calc"
+    assert result["steps"][1]["kind"] == "tool"
+    assert completions.requests[0]["tools"][0]["function"]["name"] == "calc"
+    assert completions.requests[0]["tool_choice"] == "required"
+    assert any(message["role"] == "tool" for message in result["messages"])
+
+    print("[9] Disabled-tool enforcement")
+    disabled_completions = _FakeCompletions(
+        [
+            _response(calls=[_tool_call(1, "calc", '{"expression":"1+1"}')]),
+            _response(content="blocked"),
+        ]
+    )
+    disabled_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=disabled_completions)
+    )
+    disabled = WorkbenchAgent(
+        client=disabled_client, enabled_tools=["now"]
+    ).run_turn("Use calc")
+    assert "disabled" in disabled["steps"][1]["error"]
+
+    print("[10] Malformed tool arguments")
+    malformed_completions = _FakeCompletions(
+        [
+            _response(calls=[_tool_call(1, "calc", "{bad json")]),
+            _response(content="argument error handled"),
+        ]
+    )
+    malformed_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=malformed_completions)
+    )
+    malformed = WorkbenchAgent(
+        client=malformed_client, enabled_tools=["calc"]
+    ).run_turn("Calculate")
+    assert "Malformed tool arguments" in malformed["steps"][1]["error"]
+    assert malformed["final_content"] == "argument error handled"
+
+    print("[11] Hard step cap")
+    many_calls = [_tool_call(index) for index in range(20)]
+    cap_completions = _FakeCompletions([_response(calls=many_calls)])
+    cap_client = SimpleNamespace(chat=SimpleNamespace(completions=cap_completions))
+    capped = WorkbenchAgent(client=cap_client, max_steps=999).run_turn("Run tools")
+    assert capped["status"] == "max_steps_reached"
+    assert capped["tool_steps_count"] == HARD_MAX_STEPS
+
+    print("[12] Trace cache")
+    cache = ROOT / "data" / "cache" / "smoke_trace.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(
+        export_trace_json(
+            "Agnes AI",
+            "agnes-3.0-flash",
+            str(WORKSPACE_DIR),
+            result["messages"],
+            result["steps"],
+            result["total_latency"],
+        ),
+        encoding="utf-8",
+    )
+    assert cache.exists() and '"calc"' in cache.read_text(encoding="utf-8")
+
+    print("[13] Forbidden execution APIs")
+    for source_path in [ROOT / "app.py", *sorted((ROOT / "src").rglob("*.py"))]:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and any(alias.name == "subprocess" for alias in node.names)
+            for node in ast.walk(tree)
+        )
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"eval", "exec"}
+            for node in ast.walk(tree)
+        )
+
+    print("[14] Streamlit headless render")
+    app = AppTest.from_file("app.py", default_timeout=10).run()
+    assert not app.exception
+    assert app.number_input(key="max_steps").max == HARD_MAX_STEPS
+    for name in names:
+        assert app.checkbox(key=f"tool_{name}").value is True
+    assert any(
+        caption.value.startswith("AGNESAI_API_KEY set:")
+        for caption in app.caption
+    )
+
+    print("ALL OFFLINE SMOKE CHECKS PASSED.")
 
 
 if __name__ == "__main__":
